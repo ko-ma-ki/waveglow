@@ -28,6 +28,8 @@ import argparse
 import json
 import os
 import torch
+import torch.amp
+import torch.cuda.amp
 
 #=====START: ADDED FOR DISTRIBUTED======
 from distributed import init_distributed, apply_gradient_allreduce, reduce_tensor
@@ -36,7 +38,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from torch.utils.data import DataLoader
 from glow import WaveGlow, WaveGlowLoss
-from mel2samp import Mel2Samp
+from mel2samp import Mel2Samp_aug, Mel2Samp_validation
 
 def load_checkpoint(checkpoint_path, model, optimizer):
     assert os.path.isfile(checkpoint_path)
@@ -79,9 +81,10 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
+    scaler = None
     if fp16_run:
-        from apex import amp
-        model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
+        print("use fp16")
+        scaler = torch.cuda.amp.GradScaler()
 
     # Load checkpoint if one exists
     iteration = 0
@@ -90,7 +93,8 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
                                                       optimizer)
         iteration += 1  # next iteration is iteration + 1
 
-    trainset = Mel2Samp(**data_config)
+    trainset = Mel2Samp_aug(**data_config)
+    validationset = Mel2Samp_validation(**data_config)
     # =====START: ADDED FOR DISTRIBUTED======
     train_sampler = DistributedSampler(trainset) if num_gpus > 1 else None
     # =====END:   ADDED FOR DISTRIBUTED======
@@ -99,6 +103,11 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
                               batch_size=batch_size,
                               pin_memory=False,
                               drop_last=True)
+    validation_loader = DataLoader(validationset, num_workers=1, shuffle=False,
+                                   sampler=train_sampler,
+                                   batch_size=batch_size,
+                                   pin_memory=False,
+                                   drop_last=True)
 
     # Get shared output_directory ready
     if rank == 0:
@@ -108,35 +117,57 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
         print("output directory", output_directory)
 
     if with_tensorboard and rank == 0:
-        from tensorboardX import SummaryWriter
+        from torch.utils.tensorboard import SummaryWriter
         logger = SummaryWriter(os.path.join(output_directory, 'logs'))
 
     model.train()
     epoch_offset = max(0, int(iteration / len(train_loader)))
     # ================ MAIN TRAINNIG LOOP! ===================
+    save_epoch=50 # TODO モデルを保存する頻度をコンフィグファイルやコマンドライン引数で指定できるようにする
     for epoch in range(epoch_offset, epochs):
         print("Epoch: {}".format(epoch))
+        train_loss = 0.0
         for i, batch in enumerate(train_loader):
             model.zero_grad()
-
+            
             mel, audio = batch
             mel = torch.autograd.Variable(mel.cuda())
             audio = torch.autograd.Variable(audio.cuda())
-            outputs = model((mel, audio))
-
-            loss = criterion(outputs)
-            if num_gpus > 1:
-                reduced_loss = reduce_tensor(loss.data, num_gpus).item()
-            else:
-                reduced_loss = loss.item()
-
+            
             if fp16_run:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
+                # forward
+                with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                    outputs = model((mel, audio))
+                    
+                    loss = criterion(outputs)
+                if num_gpus > 1:
+                    reduced_loss = reduce_tensor(loss.data, num_gpus).item()
+                else:
+                    reduced_loss = loss.item()
+                # backward
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                
+                # update parameters
+                scaler.step(optimizer)
+                scaler.update()
+            else:   
+                # forward
+                outputs = model((mel, audio))
+
+                loss = criterion(outputs)
+                if num_gpus > 1:
+                    reduced_loss = reduce_tensor(loss.data, num_gpus).item()
+                else:
+                    reduced_loss = loss.item()
+
+                # backward
                 loss.backward()
 
-            optimizer.step()
+                # update parameters
+                optimizer.step()
+            
+            train_loss += reduced_loss
 
             print("{}:\t{:.9f}".format(iteration, reduced_loss))
             if with_tensorboard and rank == 0:
@@ -150,6 +181,52 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
                                     checkpoint_path)
 
             iteration += 1
+        
+        train_loss = train_loss / (i + 1)
+        if with_tensorboard and rank == 0:
+            logger.add_scalar('training_loss_epoch', train_loss, epoch+1)
+
+        # 検証！！！！！
+        model.eval()
+        with torch.no_grad():
+            val_loss = 0.0
+            for i, batch in enumerate(validation_loader):
+                model.zero_grad()
+
+                mel, audio = batch
+                mel = torch.autograd.Variable(mel.cuda())
+                audio = torch.autograd.Variable(audio.cuda())
+                if fp16_run and fp16_validation:
+                    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                        outputs = model((mel, audio))
+                        loss = criterion(outputs)
+                        if num_gpus > 1:
+                            reduced_loss = reduce_tensor(loss.data, num_gpus).item()
+                        else:
+                            reduced_loss = loss.item()
+                else:
+                    outputs = model((mel, audio))
+                    loss = criterion(outputs)
+                    if num_gpus > 1:
+                        reduced_loss = reduce_tensor(loss.data, num_gpus).item()
+                    else:
+                        reduced_loss = loss.item()
+
+                val_loss += reduced_loss                
+            val_loss = val_loss / (i + 1)
+
+            if with_tensorboard and rank == 0:
+                logger.add_scalar('validation_loss_epoch', val_loss, epoch+1)
+        model.train()
+        # 検証ここまで！
+        
+        # モデルを保存する  
+        if (epoch % save_epoch == save_epoch-1 or epoch == epochs-1):
+            if rank == 0:
+                checkpoint_path = "{}/waveglow_{}epoch".format(
+                    output_directory, epoch+1)
+                save_checkpoint(model, optimizer, learning_rate, iteration,
+                                checkpoint_path)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -159,6 +236,9 @@ if __name__ == "__main__":
                         help='rank of process for distributed')
     parser.add_argument('-g', '--group_name', type=str, default='',
                         help='name of group for distributed')
+    # TODO ↓をコンフィグファイルからも指定できるようにする
+    parser.add_argument('--fp16_validation', type=str, default='false',
+                        help='if this value is \"false\", use fp32 for validation even if fp16_run is enabled')
     args = parser.parse_args()
 
     # Parse configs.  Globals nicer in this case
@@ -172,6 +252,11 @@ if __name__ == "__main__":
     dist_config = config["dist_config"]
     global waveglow_config
     waveglow_config = config["waveglow_config"]
+    # TODO train_configに含むようにしてスッキリさせる
+    if args.fp16_validation == "true":
+        fp16_validation = True
+    else:
+        fp16_validation = False
 
     num_gpus = torch.cuda.device_count()
     if num_gpus > 1:
